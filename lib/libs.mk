@@ -1,0 +1,2 @@
+CPPFLAGS += -I'libs/include'
+
