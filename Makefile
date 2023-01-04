@@ -2,7 +2,10 @@ include config.mk
 include lib/libs.mk
 all: out/shttpd
 
-out/shttpd: obj/main.c.o out
+out/shttpd: out \
+	obj/main.c.o \
+	obj/malloc_override.c.o \
+	
 	if [ -n '$(wildcard obj/*.cpp.o)' ]; then $(CXX) $(LDFLAGS) -o'out/shttpd' $(wildcard obj/*.o) $(wildcard lib/bin/*.a); else $(CC) $(LDFLAGS) -o'out/shttpd' $(wildcard obj/*.o) $(wildcard lib/bin/*.a); fi
 	$(OBJCOPY) --only-keep-debug 'out/shttpd' 'out/shttpd.dbg'
 	chmod -x 'out/shttpd.dbg'
@@ -25,4 +28,8 @@ out:
 obj:
 	$(MKDIR) obj
 
-.PHONY: clean all
+
+compiledb: clean
+	bear -- $(MAKE)
+
+.PHONY: clean all compiledb
