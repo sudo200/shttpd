@@ -8,5 +8,5 @@ RM = rm -f
 CPPFLAGS += -Wall -fPIC -g -I'./include' -pipe
 CFLAGS += $(CPPFLAGS)
 CXXFLAGS += $(CPPFLAGS)
-LDFLAGS += 
+LDFLAGS += -lshttp -lsutil
 
