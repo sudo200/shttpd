@@ -88,15 +88,7 @@ void *connection_worker(void *p) {
 
     if(status != PARSE_OK) { // Bad request
       logger_error_m(server.log, m, "Error parsing request!");
-      ret = snprintf((char *)buffer_get(buffer), buffer_size(buffer),
-            "HTTP/1.0 400\r\n"
-            "Connection: close\r\n"
-            "Server: shttpd\r\n"
-            "Content-Type: text/html\r\n"
-            "\r\n"
-            "<h1>400 Bad Request</h1>"
-          );
-      goto _send;
+      goto _break;
     }
 
     http_response_t res = {
@@ -135,7 +127,6 @@ void *connection_worker(void *p) {
     }
     send_size += status_offset + headers_offset - 2;
 
-_send:
     while (send_size > sent) {
     ret = send(
         params->con,
