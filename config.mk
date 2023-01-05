@@ -5,8 +5,8 @@ AR = ar
 MKDIR = mkdir -p
 RM = rm -f
 
-CPPFLAGS += -Wall -fPIC -g -I'./include' -pipe
+CPPFLAGS += -Wall -fPIC -g -I'./include' -pipe -Werror -pedantic
 CFLAGS += $(CPPFLAGS)
 CXXFLAGS += $(CPPFLAGS)
-LDFLAGS += -lshttp -lsutil
+LDFLAGS += -lshttp -lsutil -lpthread
 
