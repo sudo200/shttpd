@@ -103,6 +103,8 @@ __attribute__((noreturn)) int main(int argc, char **argv)
   }
 
   { // Init
+    loggerlevel = TRACE;
+
     logger_notice_m(server.log, m, "Starting shttpd...");
 
     signal(SIGALRM, SIG_IGN);

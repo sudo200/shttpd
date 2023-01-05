@@ -1,14 +1,16 @@
 #include <errno.h>
+#include <string.h>
 
 #include <pthread.h>
 
 #include <arpa/inet.h>
 #include <sys/fcntl.h>
-#include <sys/select.h>
+#include <poll.h>
 
 #include <shttp/http_request_parser.h>
 #include <shttp/http_response_parser.h>
 
+#include <sutil/buffer.h>
 #include <sutil/dmem.h>
 #include <sutil/hash.h>
 #include <sutil/hashmap.h>
@@ -16,13 +18,9 @@
 #include <sutil/mstring.h>
 #include <sutil/util.h>
 
+#include "request_handler.h"
 #include "server.h"
 #include "worker.h"
-
-__attribute__((always_inline)) static bool isopen(fd_t fd) {
-  char buf;
-  return recv(fd, &buf, 1, MSG_PEEK | MSG_DONTWAIT) != 0;
-}
 
 __attribute__((always_inline)) static void set_nonblocking(fd_t fd) {
   int flags = fcntl(fd, F_GETFL, 0);
@@ -51,7 +49,7 @@ void *connection_worker(void *p) {
     break;
   }
 
-  void *buffer = ualloc(params->buffer_size);
+  buffer_t *buffer = buffer_new(params->buffer_size);
   if(buffer == NULL) {
     logger_error_fm(server.log, m, "Could not allocate buffer: %m", NULL);
     goto _break;
@@ -62,18 +60,14 @@ void *connection_worker(void *p) {
   set_nonblocking(params->con);
 
   while(true) {
-    fd_set read_fds;
-    FD_ZERO(&read_fds);
-    FD_SET(params->con, &read_fds);
-
-    struct timeval timeout;
-    timeout.tv_sec = 5;
-    timeout.tv_usec = 0;
-
-    if(select(params->con + 1, &read_fds, NULL, NULL, &timeout) == 0 || !isopen(params->con))
+    struct pollfd fds = {
+      .fd = params->con,
+      .events = POLLIN
+    };
+    if(poll(&fds, 1, 10000) == 0)
       goto _break;
 
-    ssize_t ret = recv(params->con, buffer, params->buffer_size, 0);
+    ssize_t ret = recv(params->con, buffer_get(buffer), buffer_size(buffer), 0);
     if(ret < 0)
       switch(errno) {
         case EPIPE:
@@ -85,29 +79,70 @@ void *connection_worker(void *p) {
           logger_error_fm(server.log, m, "Error while receiving: %m", NULL);
           continue;
       }
+    if(ret == 0)
+      goto _break;
 
     http_request_t req;
     size_t body_offset;
-    parse_status_t status = parse_request(&req, buffer, ret, &body_offset);
+    parse_status_t status = parse_request(&req, buffer_get(buffer), ret, &body_offset);
 
-    if(status != PARSE_OK) { // Panic
-      goto _break;
+    if(status != PARSE_OK) { // Bad request
+      logger_error_m(server.log, m, "Error parsing request!");
+      ret = snprintf((char *)buffer_get(buffer), buffer_size(buffer),
+            "HTTP/1.0 400\r\n"
+            "Connection: close\r\n"
+            "Server: shttpd\r\n"
+            "Content-Type: text/html\r\n"
+            "\r\n"
+            "<h1>400 Bad Request</h1>"
+          );
+      goto _send;
     }
 
-    // Handle request
+    http_response_t res = {
+      .headers = hashmap_new(fnv1a)
+    };
 
-    ret = sprintf((char *)buffer,
-        "HTTP/1.1 200\r\n"
-        "Content-Type: text/plain\r\n"
-        "Connection: keep-alive\r\n"
-        "Content-Length: 13\r\n"
-        "\r\n"
-        "Hello there!\n"
-    );
+    hashmap_put(res.headers, "Server", 6UL, "shttpd");
+    hashmap_put(res.headers, "Connection", 10UL, "keep-alive");
+    hashmap_put(res.headers, "Keep-Alive", 10UL, "timeout=10, max=1000");
 
+    buffer_t *req_buffer = buffer_new_from_pointer(
+        (byte *)buffer_get(buffer) + body_offset,
+        buffer_size(buffer) - body_offset
+        );
+    buffer_t *res_buffer = NULL;
+
+    handle_request(&req, &res, req_buffer, &res_buffer);
+
+    buffer_destroy(req_buffer);
     hashmap_destroy(req.headers);
 
-    ret = send(params->con, buffer, ret, MSG_NOSIGNAL);
+    size_t status_offset, headers_offset;
+    response_status_to_string(&res.status, buffer_get(buffer), buffer_size(buffer), &status_offset);
+    headers_to_string(&res.headers, (byte *)buffer_get(buffer) + status_offset, buffer_size(buffer) - status_offset, &headers_offset);
+   
+    hashmap_destroy(res.headers);
+
+    size_t send_size = 0UL, sent = 0UL;
+    if(res_buffer != NULL) {
+      memcpy(
+          (byte *)buffer_get(buffer) + status_offset + headers_offset - 2,
+          buffer_get(res_buffer),
+          send_size = buffer_size(res_buffer)
+          );
+      buffer_destroy(res_buffer);
+    }
+    send_size += status_offset + headers_offset - 2;
+
+_send:
+    while (send_size > sent) {
+    ret = send(
+        params->con,
+        (byte *)buffer_get(buffer) + sent,
+        send_size - sent,
+        MSG_NOSIGNAL
+    );
     if(ret < 0)
       switch(errno) {
         case EPIPE:
@@ -118,14 +153,16 @@ void *connection_worker(void *p) {
         default:
           logger_error_fm(server.log, m, "Error while sending: %m", NULL);
           continue;
-      }
+        }
+    sent += ret;
+    }
   }
  
 _break:
   close(params->con);
   logger_info_m(server.log, m, "Exiting...");
   marker_destroy(m);
-  ufree(buffer);
+  buffer_destroy(buffer);
   ufree(p);
   return NULL;
 }
