@@ -1,19 +1,26 @@
 #include <string.h>
 
+#include <sutil/hash.h>
 #include <sutil/hashmap.h>
 
 #include "request_handler.h"
 
 #define stra(str) (void *)str, strlen((const char *)str)
 
-void handle_request(http_request_t *req, http_response_t *res, buffer_t *req_buf, buffer_t **res_buf) {
-  res->status.version = HTTP_1_1;
-  res->status.status = OK;
+void handle_request(http_request_t *req, buffer_t *req_buf, const response_functions_t *res) {
+  if(strcmp(req->status.url, "/") == 0) {
+    http_headers_t headers = hashmap_new(fnv1a);
 
-  hashmap_put(res->headers, stra("Content-Length"), "13");
-  hashmap_put(res->headers, stra("Content-Type"), "text/plain");
-  hashmap_put(res->headers, stra("Connection"), "keep-alive");
+    hashmap_put(headers, stra("Content-Type"), "text/plain");
+    hashmap_put(headers, stra("Content-Length"), "13");
 
-  *res_buf = buffer_new_from_string("Hello there!\n");
+    res->write_head(OK, headers);
+    hashmap_destroy(headers);
+
+    res->write_buffer(stra("Hello there!\n"));
+  }
+  else {
+    res->write_head(NOT_FOUND, NULL);
+  }
 }
 

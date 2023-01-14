@@ -22,10 +22,71 @@
 #include "server.h"
 #include "worker.h"
 
+#define thread_local  __thread
+
 __attribute__((always_inline)) static void set_nonblocking(fd_t fd) {
   int flags = fcntl(fd, F_GETFL, 0);
   fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
+
+thread_local struct {
+  size_t buffer_size;
+  http_version_t version;
+  http_headers_t headers;
+  fd_t fd;
+} tls;
+
+static void cp_headers(void *key, size_t keylen, void *value, void *pipe) {
+  hashmap_put((hashmap_t *)pipe, key, keylen, value);
+}
+
+static int write_head(http_status_t code, http_headers_t headers) {
+  http_response_t res = {
+    .status = (http_response_status_t) {
+      tls.version,
+      code,
+    },
+    tls.headers
+  };
+
+  if(headers != NULL)
+    hashmap_foreach(headers, cp_headers, res.headers);
+  
+  buffer_t *buf = buffer_new(tls.buffer_size);
+  if(buf == NULL)
+    return -1;
+
+  http_response_to_string(&res, buffer_get(buf), buffer_size(buf), NULL);
+  const size_t to_send = strlen((const char *)buffer_get(buf));
+  size_t sent = 0UL;
+  const void *buffer = buffer_get(buf);
+
+  while(to_send > sent) {
+    ssize_t s = send(tls.fd, (uint8_t *)buffer + sent, to_send - sent, MSG_NOSIGNAL);
+    if(s < 0) {
+      buffer_destroy(buf);
+      return -1;
+    }
+
+    sent += s;
+  }
+
+  buffer_destroy(buf);
+  return 0;
+}
+
+static int write_buffer(const void *buf, size_t to_send) {
+  size_t sent = 0UL;
+
+  while(to_send > sent) {
+    ssize_t s = send(tls.fd, (uint8_t *)buf + sent, to_send - sent, MSG_NOSIGNAL);
+    if(s < 0)
+      return -1;
+    sent += s;
+  }
+  return 0;
+}
+
 
 void *connection_worker(void *p) {
   worker_param_t *params = (worker_param_t *)p;
@@ -35,10 +96,12 @@ void *connection_worker(void *p) {
   marker *m = marker_new(name);
   ufree(name);
 
+  tls.buffer_size = params->buffer_size;
+  tls.fd = params->con;
+
   switch (params->addr.sa_family) {
     case AF_INET: {
       struct sockaddr_in *inet_addr = (struct sockaddr_in *)&params->addr;
-
       logger_info_fm(server.log, m, "Incoming connection from %s:%hu", inet_ntoa(inet_addr->sin_addr), ntohs(inet_addr->sin_port));
     }
     break;
@@ -91,62 +154,28 @@ void *connection_worker(void *p) {
       goto _break;
     }
 
-    http_response_t res = {
-      .headers = hashmap_new(fnv1a)
+    static const response_functions_t res = {
+      write_head,
+      write_buffer
     };
-
-    hashmap_put(res.headers, "Server", 6UL, "shttpd");
-    hashmap_put(res.headers, "Connection", 10UL, "keep-alive");
-    hashmap_put(res.headers, "Keep-Alive", 10UL, "timeout=10, max=1000");
 
     buffer_t *req_buffer = buffer_new_from_pointer(
         (byte *)buffer_get(buffer) + body_offset,
         buffer_size(buffer) - body_offset
         );
-    buffer_t *res_buffer = NULL;
 
-    handle_request(&req, &res, req_buffer, &res_buffer);
+    tls.headers = hashmap_new(fnv1a);
+    hashmap_put(tls.headers, "Connection", 10UL, "keep-alive");
+    hashmap_put(tls.headers, "Content-Length", 14UL, "0");
+    hashmap_put(tls.headers, "Keep-Alive", 10UL, "timeout=10");
+    hashmap_put(tls.headers, "Server", 6UL, "shttpd");
+    tls.version = req.status.version;
 
-    buffer_destroy(req_buffer);
+    handle_request(&req, req_buffer, &res);
+
+    hashmap_destroy(tls.headers);
     hashmap_destroy(req.headers);
-
-    size_t status_offset, headers_offset;
-    response_status_to_string(&res.status, buffer_get(buffer), buffer_size(buffer), &status_offset);
-    headers_to_string(&res.headers, (byte *)buffer_get(buffer) + status_offset, buffer_size(buffer) - status_offset, &headers_offset);
-   
-    hashmap_destroy(res.headers);
-
-    size_t send_size = 0UL, sent = 0UL;
-    if(res_buffer != NULL) {
-      memcpy(
-          (byte *)buffer_get(buffer) + status_offset + headers_offset - 2,
-          buffer_get(res_buffer),
-          send_size = buffer_size(res_buffer)
-          );
-      buffer_destroy(res_buffer);
-    }
-    send_size += status_offset + headers_offset - 2;
-
-    while (send_size > sent) {
-    ret = send(
-        params->con,
-        (byte *)buffer_get(buffer) + sent,
-        send_size - sent,
-        MSG_NOSIGNAL
-    );
-    if(ret < 0)
-      switch(errno) {
-        case EPIPE:
-        case ECONNRESET:
-          logger_info_m(server.log, m, close_msg);
-          goto _break;
-
-        default:
-          logger_error_fm(server.log, m, "Error while sending: %m", NULL);
-          continue;
-        }
-    sent += ret;
-    }
+    buffer_destroy(req_buffer);
   }
  
 _break:
