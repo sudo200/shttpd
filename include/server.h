@@ -3,9 +3,13 @@
 
 #include <sutil/logger.h>
 
+#ifndef noreturn
+#define noreturn  __attribute__((noreturn))
+#endif  //noreturn
+
 typedef struct {
   logger_t *log;
-  __attribute__((noreturn)) void (*exit)(int code);
+  noreturn void (*exit)(int code);
 } http_server_t;
 
 extern http_server_t server;

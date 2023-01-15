@@ -7,6 +7,8 @@ out/shttpd: out \
 	obj/malloc_override.c.o \
 	obj/worker.c.o \
 	obj/request_handler.c.o \
+	obj/config.c.o \
+	obj/help.c.o \
 	
 	if [ -n '$(wildcard obj/*.cpp.o)' ]; then $(CXX) -o'out/shttpd' $(wildcard obj/*.o) $(wildcard lib/bin/*.a) $(LDFLAGS); else $(CC) -o'out/shttpd' $(wildcard obj/*.o) $(wildcard lib/bin/*.a) $(LDFLAGS); fi
 	$(OBJCOPY) --only-keep-debug 'out/shttpd' 'out/shttpd.dbg'

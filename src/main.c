@@ -1,7 +1,9 @@
 #include "malloc_override.h"
+#include "request_handler.h"
 #include "server.h"
 #include "worker.h"
 
+#include <dlfcn.h>
 #include <pthread.h>
 
 #include <setjmp.h>
@@ -17,13 +19,19 @@
 #include <sutil/logger.h>
 #include <sutil/util.h>
 
+#include "config.h"
+
+#define constructor __attribute__((constructor))
+#define destructor  __attribute__((destructor))
+#define noreturn    __attribute__((noreturn))
+
 #define die(msg)  do { logger_fatal_fm(server.log, m, "%s: %m", msg); exit(EXIT_FAILURE); } while(0)
 
 static volatile bool run = true;
 static volatile int exit_code;
 static jmp_buf jump;
 
-__attribute__((noreturn)) static void server_exit(int code) {
+static noreturn void server_exit(int code) {
   run = false;
   exit_code = code;
   longjmp(jump, 1);
@@ -36,7 +44,7 @@ http_server_t server = {
 
 static marker *m;
 
-__attribute__((constructor)) static void constructor(void) {
+static constructor void constr(void) {
   ualloc = malloc;
   urealloc = realloc;
   ufree = free;
@@ -45,7 +53,7 @@ __attribute__((constructor)) static void constructor(void) {
   m = marker_new("MAIN");
 }
 
-__attribute__((destructor)) static void destructor(void) {
+static destructor void destr(void) {
   marker_destroy(m);
   logger_destroy(server.log);
 }
@@ -70,42 +78,31 @@ void sighandler(int sig) {
   }
 }
 
-__attribute__((noreturn)) int main(int argc, char **argv)
+noreturn int main(int argc, char **argv)
 {
-  fd_t srv_sock;
   worker_param_t *params;
-  struct sockaddr addr = {
-    .sa_family = AF_INET
-  };
-  socklen_t addrlen;
-
-  switch(addr.sa_family) {
-    case AF_INET: {
-        struct sockaddr_in *in_addr = (struct sockaddr_in *)&addr;
-        inet_aton("0.0.0.0", &in_addr->sin_addr);
-        in_addr->sin_port = htons(8080);
-        addrlen = sizeof(*in_addr);
-      }
-      break;
-
-    case AF_UNIX: {
-        struct sockaddr_un *un_addr = (struct sockaddr_un *)&addr;
-        strncpy(un_addr->sun_path, "socket.sock", 108);
-        unlink(un_addr->sun_path);
-        addrlen = sizeof(*un_addr);
-      }
-      break;
-
-    default: {
-      logger_fatal_m(server.log, m, "Address family not supported!");
-      exit(EXIT_FAILURE);
-    }
-  }
+  socklen_t addr_len;
+  void *module = NULL;
 
   { // Init
+    set_config(argc, argv);
+
+    if(!config.interactive) {
+      pid_t p = fork();
+      if(p < 0)
+        die("Could not fork into background");
+
+      if(p > 0) { // Parent
+        sleep(1);
+        _exit(EXIT_SUCCESS);
+      } else
+        setsid();
+    }
+
     loggerlevel = TRACE;
 
     logger_notice_m(server.log, m, "Starting shttpd...");
+    logger_notice_fm(server.log, m, "PID: %d", getpid());
 
     signal(SIGALRM, SIG_IGN);
     signal(SIGPIPE, SIG_IGN);
@@ -114,20 +111,24 @@ __attribute__((noreturn)) int main(int argc, char **argv)
     setsignal(SIGHUP, sighandler);
     setsignal(SIGSEGV, sighandler);
 
-    if((srv_sock = socket(addr.sa_family, SOCK_STREAM, 0)) < 0)
-      die("socket");
+    uint8_t dummy[0xFF];
+    addr_len = sizeof(dummy);
+    getsockname(config.sock_fd, (struct sockaddr *)dummy, &addr_len);
 
-    const int tru = true;
-    if(setsockopt(srv_sock, SOL_SOCKET, SO_REUSEADDR, &tru, sizeof(tru)) < 0)
-      die("setsockopt");
+    do {
+      if(config.module_path != NULL) {
+        if((module = dlopen(config.module_path, RTLD_LAZY | RTLD_LOCAL)) == NULL) {
+          logger_error_fm(server.log, m, "Error loading module: %s", dlerror());
+          break;
+        }
 
-    setsockopt(srv_sock, SOL_SOCKET, SO_KEEPALIVE, &tru, sizeof(tru));
-
-    if(bind(srv_sock, &addr, addrlen) < 0)
-      die("bind");
-
-    if(listen(srv_sock, 0xFF) < 0)
-      die("listen");
+        void *func = dlsym(module, "handle_request");
+        if(func == NULL) {
+          logger_error_fm(server.log, m, "Error resolving handler function from module: %s", dlerror());
+        } else
+          *(void **)&handle_request = func;
+      }
+    } while(0);
 
     logger_notice_m(server.log, m, "shttp started!");
   }
@@ -135,9 +136,9 @@ __attribute__((noreturn)) int main(int argc, char **argv)
   setjmp(jump);
   while (run) {
     params = (worker_param_t *)ualloc(sizeof(*params));
-    params->addrlen = addrlen;
+    params->addrlen = addr_len;
     params->buffer_size = 4095;
-    params->con = accept(srv_sock, &params->addr, &params->addrlen);
+    params->con = accept(config.sock_fd, &params->addr, &params->addrlen);
 
     if(params->con < 0) {
       ufree(params);
@@ -153,10 +154,15 @@ __attribute__((noreturn)) int main(int argc, char **argv)
   
   { // Clean up
     logger_notice_m(server.log, m, "Shutting down!");
-    shutdown(srv_sock, SHUT_RDWR);
+    shutdown(config.sock_fd, SHUT_RDWR);
     ufree(params);
 
-    close(srv_sock);
+    close(config.sock_fd);
+    if(config.module_opts.arr != NULL)
+      ufree(*config.module_opts.arr);
+    ufree(config.module_opts.arr);
+    if(module != NULL)
+      dlclose(module);
     logger_notice_fm(server.log, m, "Exiting with code '%d'!", exit_code);
   }
 
